@@ -4,3 +4,4 @@ pytesseract
 pymupdf
 pymupdf4llm
 pytest
+google-genai
