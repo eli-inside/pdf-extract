@@ -3,5 +3,6 @@ pdf2image
 pytesseract
 pymupdf
 pymupdf4llm
+pymupdf-layout
 pytest
 google-genai

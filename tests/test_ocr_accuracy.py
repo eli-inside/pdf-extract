@@ -22,9 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pdf_to_text import (
     extract_with_pymupdf,
-    extract_dual_column_ocr,
-    extract_single_column_ocr,
-    detect_columns,
+    extract_with_ocr,
     clean_text,
 )
 
@@ -258,45 +256,25 @@ class TestOCRAccuracy:
         assert similarity >= SIMILARITY_THRESHOLD, \
             f"Text similarity ({similarity:.2%}) is below threshold ({SIMILARITY_THRESHOLD:.0%})"
 
-    @pytest.mark.parametrize("pdf_name", TWO_COLUMN_PDFS)
-    def test_two_column_detection(self, pdf_name):
-        """Test that two-column PDFs are correctly detected."""
-        pdf_path = TEST_DATA_DIR / pdf_name
-        if not pdf_path.exists():
-            pytest.skip(f"Test PDF not found: {pdf_path}")
-
-        is_dual, gutter = detect_columns(str(pdf_path))
-
-        print(f"\n{pdf_name}:")
-        print(f"  Detected as dual-column: {is_dual}")
-        print(f"  Gutter position: {gutter}")
-
-        assert is_dual, f"{pdf_name} should be detected as two-column"
-
-
 class TestOCRPipelineIntegration:
     """Integration tests for the full OCR pipeline."""
 
     @pytest.mark.parametrize("pdf_name", TWO_COLUMN_PDFS[:2])  # Test with first 2 PDFs
-    def test_dual_column_ocr_pipeline(self, pdf_name):
-        """Test the extract_dual_column_ocr function produces readable output."""
+    def test_ocr_pipeline(self, pdf_name):
+        """Test the extract_with_ocr function produces readable output."""
         pdf_path = TEST_DATA_DIR / pdf_name
         if not pdf_path.exists():
             pytest.skip(f"Test PDF not found: {pdf_path}")
 
-        # Get gutter position
-        _, gutter = detect_columns(str(pdf_path))
-        gutter = gutter or 0.5
-
-        # Run dual-column OCR
-        ocr_output = extract_dual_column_ocr(str(pdf_path), dpi=200, gutter_ratio=gutter)
+        # Run OCR pipeline (uses Gemini vision for layout detection)
+        ocr_output = extract_with_ocr(str(pdf_path), dpi=200)
         ocr_output = clean_text(ocr_output)
 
         # Basic sanity checks
         word_count = len(ocr_output.split())
 
         print(f"\n{pdf_name}:")
-        print(f"  Dual-column OCR word count: {word_count}")
+        print(f"  OCR word count: {word_count}")
         print(f"  Sample (first 200 chars): {ocr_output[:200]}...")
 
         assert word_count > 100, f"OCR output too short: {word_count} words"

@@ -1,14 +1,15 @@
 # pdf-extract
 
-A robust PDF text extraction tool that handles text-based and scanned PDFs, with automatic multi-column layout detection.
+A PDF text extraction tool designed for audiobook conversion. Uses OCR with AI-powered layout detection to reliably extract text from academic papers, including those with copy-protection or complex multi-column layouts.
 
 ## Features
 
-- **Auto-detection**: Automatically determines if a PDF needs OCR or has extractable text
-- **Multi-column support**: Detects and properly orders two-column academic paper layouts
+- **OCR-first pipeline**: Renders PDFs to images and uses OCR, bypassing font encoding issues
+- **AI layout detection**: Gemini Pro vision detects headers, columns, and footers per page
+- **Multi-column support**: Properly orders two-column academic paper layouts
+- **LLM post-processing**: Gemini Flash Lite fixes OCR errors (drop caps, typos, etc.)
 - **Smart header removal**: Automatically detects and removes running headers/footers
-- **OCR support**: Uses Tesseract for scanned documents
-- **Configurable**: DPI settings, custom header patterns, force modes
+- **Configurable**: DPI settings, skip LLM, force text mode
 
 ## Installation
 
@@ -21,65 +22,75 @@ sudo apt install tesseract-ocr poppler-utils
 
 # Python dependencies
 pip install -r requirements.txt
+
+# Required: Gemini API key
+export GEMINI_API_KEY="your-key-here"  # or GOOGLE_API_KEY
 ```
 
 ## Usage
 
 ```bash
-# Basic usage - auto-detects PDF type and column layout
+# Basic usage - OCR pipeline with AI layout detection
 python pdf_to_text.py document.pdf
 
 # Specify output file
 python pdf_to_text.py document.pdf output.txt
 
-# Force OCR (for problematic text PDFs)
-python pdf_to_text.py document.pdf --force-ocr
-
 # Higher DPI for better OCR quality
-python pdf_to_text.py document.pdf --dpi 400
+python pdf_to_text.py document.pdf --dpi 300
 
-# Force single or dual column mode
-python pdf_to_text.py document.pdf --single-column
-python pdf_to_text.py document.pdf --dual-column
+# Skip LLM post-processing (faster)
+python pdf_to_text.py document.pdf --no-llm
+
+# Force direct text extraction (may have font issues)
+python pdf_to_text.py document.pdf --force-text
 
 # Add custom header patterns to remove (regex)
 python pdf_to_text.py document.pdf --headers "RUNNING HEADER" "Author Name"
+
+# Skip header/footer cleaning
+python pdf_to_text.py document.pdf --no-clean
 ```
 
 ## Options
 
 | Option | Description |
 |--------|-------------|
-| `--dpi N` | DPI for OCR (default: 300) |
-| `--force-ocr` | Force OCR even if text is extractable |
-| `--force-text` | Force text extraction even if PDF appears scanned |
-| `--single-column` | Force single-column extraction |
-| `--dual-column` | Force dual-column extraction |
-| `--headers PATTERN...` | Additional header patterns to remove (regex) |
+| `--dpi N` | DPI for rendering (default: 200) |
+| `--force-text` | Use direct text extraction instead of OCR |
+| `--no-llm` | Skip LLM post-processing (faster but lower quality) |
 | `--no-clean` | Skip header/footer cleaning |
+| `--headers PATTERN...` | Additional header patterns to remove (regex) |
 
 ## How It Works
 
-1. **Detection**:
-   - Checks if PDF has extractable text using pdftotext
-   - Analyzes word positions to detect two-column layouts
+1. **Rendering**: PDF pages are rendered to images at the specified DPI (default 200)
 
-2. **Extraction**:
-   - Text PDFs: Uses PyMuPDF (pymupdf4llm) which automatically handles multi-column layouts
-   - Scanned single-column: Full-page OCR with Tesseract
-   - Scanned dual-column: Splits page at detected gutter, OCRs each half separately
+2. **Layout Detection**: Gemini Pro vision analyzes each page image to identify:
+   - Header region (full-width content at top)
+   - Body region (single or dual-column)
+   - Footer region (full-width content at bottom)
+   - Column gutter position for dual-column pages
 
-3. **Cleaning**:
-   - Detects running headers by finding lines that repeat across pages (with different page numbers)
-   - Removes standalone page numbers, DOIs, copyright notices, and other artifacts
+3. **OCR Extraction**: Tesseract extracts text from each region in proper reading order:
+   - Header → Left column → Right column → Footer
+
+4. **Cleaning**: Removes running headers/footers by detecting:
+   - Lines that repeat across pages (with different page numbers)
+   - Standalone page numbers, DOIs, copyright notices
+
+5. **LLM Correction** (optional): Gemini Flash Lite fixes:
+   - Drop caps that got separated (e.g., "F rebels" → "IF rebels")
+   - OCR typos (e.g., "rn" misread as "m")
+   - Corrupted unicode characters
 
 ## Dependencies
 
-- **pymupdf4llm**: Primary text extraction with automatic column handling
-- **pdfplumber**: Column layout detection
-- **pytesseract**: OCR for scanned documents
+- **google-genai**: Gemini API for vision layout detection and LLM post-processing
 - **pdf2image**: PDF to image conversion for OCR
+- **pytesseract**: OCR engine for text extraction
 - **poppler** (pdftotext): Quick text detection
+- **pymupdf4llm**: Alternative direct text extraction
 
 ## License
 

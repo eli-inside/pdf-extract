@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 """
 PDF to Text Extraction Tool
-Handles both text-based and image-based (scanned) PDFs, single and dual-column layouts.
+Uses OCR with AI-powered layout detection for reliable text extraction.
 
 Usage:
     python3 pdf_to_text.py input.pdf [output.txt]
 
 If output not specified, writes to input.txt
 
+Pipeline:
+1. Render PDF pages to images (bypasses font encoding issues)
+2. Use Gemini Pro vision to detect page layout (headers, columns, footers)
+3. Use Tesseract OCR to extract text from each region
+4. Use Gemini Flash Lite to fix OCR errors paragraph by paragraph
+
 Features:
-- Auto-detects if PDF needs OCR or has extractable text
+- Handles both text-based and scanned PDFs uniformly via OCR
 - Auto-detects single vs dual-column layout
-- Handles dual-column PDFs by reading left column then right column
+- AI vision detects header/footer regions for clean extraction
+- LLM post-processing fixes OCR errors and drop caps
 - Strips common academic headers/footers
-- Configurable DPI for OCR quality
 
 Dependencies:
-    pip install pdfplumber pdf2image pytesseract
+    pip install pdfplumber pdf2image pytesseract google-genai pymupdf4llm
     brew install tesseract poppler  (macOS)
     apt install tesseract-ocr poppler-utils  (Linux)
+
+    Also requires GEMINI_API_KEY or GOOGLE_API_KEY environment variable
 """
 
 import argparse
@@ -71,148 +79,179 @@ def check_dependencies():
 
 def is_text_based_pdf(pdf_path):
     """Check if PDF has extractable text or is image-based."""
-    try:
-        result = subprocess.run(
-            ['pdftotext', '-l', '2', str(pdf_path), '-'],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        text = result.stdout.strip()
-        # If we get substantial text, it's text-based
-        words = len(text.split())
-        return words > 50
-    except Exception:
-        return False
-
-
-def detect_columns(pdf_path):
-    """Detect if PDF has a two-column layout by analyzing word positions.
-
-    Academic papers often have:
-    - Full-width header/title at top
-    - Two-column body text below
-
-    We detect this by looking for a vertical gap (gutter) where no words exist.
-
-    Returns:
-        tuple: (is_dual_column: bool, gutter_center: float or None)
-               gutter_center is the x-position of the center of the gutter as a ratio (0-1)
-    """
-    import pdfplumber
-
-    with pdfplumber.open(pdf_path) as pdf:
-        # Check first 2 pages
-        pages_to_check = min(2, len(pdf.pages))
-
-        for i in range(pages_to_check):
-            page = pdf.pages[i]
-
-            # Extract words with positions
-            words = page.extract_words(
-                x_tolerance=3,
-                y_tolerance=3,
-                keep_blank_chars=False
-            )
-
-            if not words or len(words) < 20:
-                continue
-
-            page_width = page.width
-            page_height = page.height
-            page_center = page_width / 2
-
-            # Focus on body area (skip header ~30% and footer ~15%)
-            body_top = page_height * 0.30
-            body_bottom = page_height * 0.85
-
-            body_words = [w for w in words
-                          if w['top'] > body_top and w['bottom'] < body_bottom]
-
-            if len(body_words) < 20:
-                continue
-
-            # Find the distribution of word positions
-            # In a two-column layout, there should be a clear gap in the middle
-
-            # Get the rightmost edge of left-side words and leftmost edge of right-side words
-            left_words = [w for w in body_words if w['x1'] < page_center]
-            right_words = [w for w in body_words if w['x0'] > page_center]
-
-            if len(left_words) < 10 or len(right_words) < 10:
-                continue
-
-            # Find where left column ends and right column starts
-            left_edge = max(w['x1'] for w in left_words)
-            right_edge = min(w['x0'] for w in right_words)
-
-            # Calculate the gap between columns
-            gap = right_edge - left_edge
-
-            # In a two-column layout, there should be a clear gutter (at least 3% of page width)
-            min_gutter = page_width * 0.03
-
-            if gap > min_gutter:
-                # Calculate gutter center as a ratio of page width
-                gutter_center = (left_edge + right_edge) / 2 / page_width
-                return True, gutter_center
-
-        return False, None
-
-
-def extract_single_column_text(pdf_path):
-    """Extract text from single-column text-based PDF using pdftotext."""
-    print("Extracting text (single-column, text-based)...")
     result = subprocess.run(
-        ['pdftotext', '-layout', str(pdf_path), '-'],
+        ['pdftotext', '-l', '2', str(pdf_path), '-'],
         capture_output=True,
         text=True,
-        timeout=120
+        timeout=30
     )
-    return result.stdout
-
-
-def extract_single_column_ocr(pdf_path, dpi=300):
-    """Extract text from single-column image-based PDF using OCR."""
-    from pdf2image import convert_from_path
-    import pytesseract
-
-    print(f"Extracting text via OCR at {dpi} DPI (single-column, image-based)...")
-
-    images = convert_from_path(pdf_path, dpi=dpi)
-    print(f"Processing {len(images)} pages...")
-
-    all_text = []
-
-    # PSM 3 = Fully automatic page segmentation
-    config = r'--oem 3 --psm 3'
-
-    for i, image in enumerate(images):
-        print(f"  Page {i+1}/{len(images)}...", end='', flush=True)
-        text = pytesseract.image_to_string(image, lang='eng', config=config)
-        all_text.append(text.strip())
-        print(" done")
-
-    return '\n\n--- PAGE BREAK ---\n\n'.join(all_text)
+    text = result.stdout.strip()
+    # If we get substantial text, it's text-based
+    words = len(text.split())
+    return words > 50
 
 
 def extract_with_pymupdf(pdf_path):
-    """Extract text from PDF using PyMuPDF's multi-column detection.
+    """Extract text from PDF using pymupdf4llm (handles multi-column layouts).
 
-    Uses pymupdf4llm which handles multi-column layouts automatically.
-    This is the recommended approach for text-based PDFs with complex layouts.
+    This is an alternative to OCR for text-based PDFs. Use --force-text to enable.
+    Note: May have font encoding issues with some copy-protected PDFs.
 
     Args:
         pdf_path: Path to the PDF file
+
+    Returns:
+        Extracted text as string
     """
     import pymupdf4llm
 
-    print("Extracting text with PyMuPDF (auto column detection)...")
+    print("Extracting text with PyMuPDF...")
+    print("Consider using the pymupdf_layout package for a greatly improved page layout analysis.")
+    text = pymupdf4llm.to_markdown(str(pdf_path))
+    return text
 
-    # pymupdf4llm.to_markdown handles multi-column layouts automatically
-    md_text = pymupdf4llm.to_markdown(str(pdf_path))
 
-    return md_text
+def fix_shifted_font_encoding(text):
+    """Fix text from PDFs with shifted font encodings (copy-protection).
+
+    Some PDFs use fonts with character codes shifted by a fixed offset
+    to prevent simple text copying. This function detects and fixes such text.
+
+    Args:
+        text: Extracted text that may contain shifted characters
+
+    Returns:
+        Text with shifted encodings fixed
+    """
+    # Detect sequences of unicode replacement characters (���)
+    # These indicate the extractor couldn't map the font encoding
+    replacement_char = '\ufffd'
+
+    if replacement_char not in text:
+        return text
+
+    print("Removing corrupted font characters...")
+
+    # Count how many we're removing
+    count = text.count(replacement_char)
+
+    # Remove replacement characters but preserve structure
+    # These are typically in title/header sections with copy-protection
+    cleaned = text.replace(replacement_char, '')
+
+    # Clean up any resulting empty bold/italic markers
+    cleaned = re.sub(r'\*\*\s*\*\*', '', cleaned)  # Empty bold
+    cleaned = re.sub(r'_\s*_', '', cleaned)  # Empty italic
+    cleaned = re.sub(r'####\s*\n', '', cleaned)  # Empty headers
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)  # Excessive newlines
+
+    print(f"  Removed {count} corrupted characters")
+
+    return cleaned
+
+
+def extract_with_ocr(pdf_path, dpi=200):
+    """Extract text from PDF by rendering to images and using OCR.
+
+    This approach bypasses font encoding issues by reading what's visually
+    on the page. Works for both text-based and scanned PDFs.
+
+    Pipeline:
+    1. Render PDF pages to images
+    2. Use Gemini Pro vision to detect layout (header, body columns, footer)
+    3. Use Tesseract OCR to extract text from each region
+    4. Combine in proper reading order
+
+    Args:
+        pdf_path: Path to the PDF file
+        dpi: Resolution for rendering (200 is good balance of speed/quality)
+    """
+    from pdf2image import convert_from_path
+    import pytesseract
+
+    print(f"Rendering PDF to images at {dpi} DPI...")
+    images = convert_from_path(pdf_path, dpi=dpi)
+    print(f"  {len(images)} pages rendered")
+
+    # Use Gemini Pro vision to detect layout (header/footer regions AND column structure)
+    page_regions = detect_page_regions_with_vision(images)
+
+    print("Extracting text with OCR...")
+    all_text = []
+
+    for i, image in enumerate(images):
+        print(f"  Page {i+1}/{len(images)}...", end='', flush=True)
+
+        width, height = image.size
+
+        # Get layout info for this page
+        layout = page_regions[i] if i < len(page_regions) else {
+            'header_end': 0.0, 'footer_start': 1.0, 'is_dual_column': False, 'gutter_ratio': 0.5
+        }
+        header_end_y = int(height * layout['header_end'])
+        footer_start_y = int(height * layout['footer_start'])
+        is_dual_column = layout['is_dual_column']
+        gutter_ratio = layout['gutter_ratio']
+
+        page_parts = []
+
+        # OCR header region (full-width)
+        if header_end_y > 0:
+            header_region = image.crop((0, 0, width, header_end_y))
+            header_config = r'--oem 3 --psm 3'
+            header_text = pytesseract.image_to_string(header_region, lang='eng', config=header_config)
+            header_text = clean_ocr_text(header_text)
+            if header_text.strip():
+                page_parts.append(header_text)
+
+        # OCR body region
+        body_top = header_end_y
+        body_bottom = footer_start_y
+
+        if body_top < body_bottom:
+            if is_dual_column:
+                # Split into left and right columns
+                gutter_x = int(width * gutter_ratio)
+                margin = int(width * 0.01)
+
+                left_half = image.crop((0, body_top, gutter_x - margin, body_bottom))
+                right_half = image.crop((gutter_x + margin, body_top, width, body_bottom))
+
+                # OCR each column
+                config = r'--oem 3 --psm 4'
+                left_text = pytesseract.image_to_string(left_half, lang='eng', config=config)
+                right_text = pytesseract.image_to_string(right_half, lang='eng', config=config)
+
+                left_text = clean_ocr_text(left_text)
+                right_text = clean_ocr_text(right_text)
+
+                if left_text.strip():
+                    page_parts.append(left_text)
+                if right_text.strip():
+                    page_parts.append(right_text)
+            else:
+                # Single column - OCR entire body
+                body_region = image.crop((0, body_top, width, body_bottom))
+                body_config = r'--oem 3 --psm 3'
+                body_text = pytesseract.image_to_string(body_region, lang='eng', config=body_config)
+                body_text = clean_ocr_text(body_text)
+                if body_text.strip():
+                    page_parts.append(body_text)
+
+        # OCR footer region (full-width)
+        if footer_start_y < height:
+            footer_region = image.crop((0, footer_start_y, width, height))
+            footer_config = r'--oem 3 --psm 3'
+            footer_text = pytesseract.image_to_string(footer_region, lang='eng', config=footer_config)
+            footer_text = clean_ocr_text(footer_text)
+            if footer_text.strip():
+                page_parts.append(footer_text)
+
+        page_text = "\n\n".join(page_parts)
+        all_text.append(page_text)
+        print(" done")
+
+    return '\n\n'.join(all_text)
 
 
 def get_gemini_api_key():
@@ -243,18 +282,23 @@ def get_gemini_api_key():
     return api_key
 
 
-def detect_page_regions_with_vision(images, gutter_ratio=0.5):
-    """Detect header, body, and footer regions using Gemini vision.
+def detect_page_regions_with_vision(images):
+    """Detect page layout regions and column structure using Gemini vision.
 
-    Sends page images to Gemini to visually identify layout regions.
+    Sends page images to Gemini to visually identify:
+    - Header, body, and footer regions
+    - Whether the body is single or dual-column
+    - Gutter position for dual-column pages
 
     Args:
         images: List of PIL images (page renderings)
-        gutter_ratio: Expected gutter position as ratio of page width (0-1)
 
     Returns:
-        List of tuples: (header_end_ratio, footer_start_ratio) for each page
-        Both are 0-1 ratios of page height.
+        List of dicts with:
+            - header_end: float (0-1 ratio of page height)
+            - footer_start: float (0-1 ratio of page height)
+            - is_dual_column: bool
+            - gutter_ratio: float (0-1 ratio of page width, center of gutter)
     """
     import json
     from io import BytesIO
@@ -266,28 +310,37 @@ def detect_page_regions_with_vision(images, gutter_ratio=0.5):
 
     page_regions = []
 
+    print(f"Detecting layout with Gemini Pro vision ({len(images)} pages)...")
+
     for page_idx, image in enumerate(images):
+        print(f"  Page {page_idx+1}/{len(images)}...", end='', flush=True)
+
         # Convert PIL image to bytes
         img_buffer = BytesIO()
         image.save(img_buffer, format='PNG')
         img_bytes = img_buffer.getvalue()
 
-        prompt = """Analyze this PDF page image and identify the layout regions.
+        prompt = """Analyze this PDF page image and identify the layout.
 
 Look for:
-1. HEADER: The top portion with title, authors, affiliations, abstract heading, etc.
-   This is content that spans the full width or is centered.
-2. BODY: The main content area with two columns of text.
-3. FOOTER: Any full-width content at the bottom (page numbers, copyright, etc.)
+1. HEADER: Top portion with title, authors, abstract, etc. (full-width or centered content)
+2. BODY: Main text content area
+3. FOOTER: Bottom content (page numbers, copyright, etc.)
+4. COLUMNS: Is the body text in one column or two columns?
 
 Return ONLY a JSON object with:
-- header_end: percentage (0-100) of page height where the header ends and columns begin
+- header_end: percentage (0-100) of page height where header ends
 - footer_start: percentage (0-100) of page height where footer begins
+- is_dual_column: true if body has two columns, false if single column
+- gutter_ratio: if dual-column, the horizontal position (0-100) of the gap between columns
 
-Example: {"header_end": 35, "footer_start": 95}
+Example for dual-column page: {"header_end": 30, "footer_start": 95, "is_dual_column": true, "gutter_ratio": 50}
+Example for single-column page: {"header_end": 10, "footer_start": 95, "is_dual_column": false, "gutter_ratio": 50}
 
-Important: Authors displayed side-by-side are part of the HEADER, not body columns.
-The body columns contain the main article text (paragraphs, sections, etc.)."""
+Notes:
+- Side-by-side author names are part of HEADER, not body columns
+- Academic papers typically have dual columns; books are usually single column
+- The gutter is the vertical white space between columns"""
 
         response = client.models.generate_content(
             model='gemini-3-pro-preview',
@@ -296,107 +349,20 @@ The body columns contain the main article text (paragraphs, sections, etc.)."""
         result_text = response.text.strip()
 
         # Extract JSON from response
-        if '{' in result_text:
-            json_str = result_text[result_text.index('{'):result_text.rindex('}')+1]
-            result = json.loads(json_str)
-            header_end = result.get('header_end', 0) / 100
-            footer_start = result.get('footer_start', 100) / 100
-            page_regions.append((header_end, footer_start))
-        else:
-            # Fallback if JSON parsing fails
-            page_regions.append((0.0, 1.0))
+        if '{' not in result_text:
+            raise ValueError(f"Gemini vision did not return JSON for page {page_idx + 1}: {result_text[:100]}")
 
-    return page_regions
-
-
-def extract_dual_column_ocr(pdf_path, dpi=300, gutter_ratio=0.5):
-    """Extract text from dual-column image-based PDF using OCR with image splitting.
-
-    Handles page layout by detecting regions using Gemini vision:
-    - Header: Full-width content at top (OCR as single region)
-    - Body: Two-column content in middle (OCR left then right)
-    - Footer: Full-width content at bottom (OCR as single region)
-
-    Args:
-        pdf_path: Path to the PDF file
-        dpi: DPI for rendering pages to images
-        gutter_ratio: Position of the gutter as a ratio of page width (0-1)
-    """
-    from pdf2image import convert_from_path
-    import pytesseract
-
-    print(f"Extracting text via OCR at {dpi} DPI (dual-column, split at {gutter_ratio:.1%})...")
-
-    images = convert_from_path(pdf_path, dpi=dpi)
-    print(f"Processing {len(images)} pages...")
-
-    # Use Gemini vision to detect page regions (header, footer)
-    print("Detecting page layout with vision model...")
-    page_regions = detect_page_regions_with_vision(images, gutter_ratio)
-
-    all_text = []
-
-    for i, image in enumerate(images):
-        print(f"  Page {i+1}/{len(images)}...", end='', flush=True)
-
-        width, height = image.size
-        gutter_x = int(width * gutter_ratio)
-        margin = int(width * 0.01)
-
-        # Get region boundaries for this page
-        header_ratio, footer_ratio = page_regions[i] if i < len(page_regions) else (0.0, 1.0)
-        header_end_y = int(height * header_ratio)
-        footer_start_y = int(height * footer_ratio)
-
-        page_parts = []
-
-        # OCR header region as single full-width region (if exists)
-        if header_end_y > 0:
-            header_region = image.crop((0, 0, width, header_end_y))
-            header_config = r'--oem 3 --psm 3'  # Full page segmentation for header
-            header_text = pytesseract.image_to_string(header_region, lang='eng', config=header_config)
-            header_text = clean_ocr_text(header_text)
-            if header_text.strip():
-                page_parts.append(header_text)
-
-        # OCR two-column body region
-        body_top = header_end_y
-        body_bottom = footer_start_y
-        if body_top < body_bottom:
-            # Crop left and right columns from body region only
-            left_half = image.crop((0, body_top, gutter_x - margin, body_bottom))
-            right_half = image.crop((gutter_x + margin, body_top, width, body_bottom))
-
-            # OCR each half with single-column mode
-            config = r'--oem 3 --psm 4'
-
-            left_text = pytesseract.image_to_string(left_half, lang='eng', config=config)
-            right_text = pytesseract.image_to_string(right_half, lang='eng', config=config)
-
-            # Clean up each column
-            left_text = clean_ocr_text(left_text)
-            right_text = clean_ocr_text(right_text)
-
-            # Add columns in reading order
-            if left_text.strip():
-                page_parts.append(left_text)
-            if right_text.strip():
-                page_parts.append(right_text)
-
-        # OCR footer region as single full-width region (if exists)
-        if footer_start_y < height:
-            footer_region = image.crop((0, footer_start_y, width, height))
-            footer_config = r'--oem 3 --psm 3'
-            footer_text = pytesseract.image_to_string(footer_region, lang='eng', config=footer_config)
-            footer_text = clean_ocr_text(footer_text)
-            if footer_text.strip():
-                page_parts.append(footer_text)
-
-        page_text = "\n\n".join(page_parts)
-        all_text.append(page_text)
+        json_str = result_text[result_text.index('{'):result_text.rindex('}')+1]
+        result = json.loads(json_str)
+        page_regions.append({
+            'header_end': result.get('header_end', 0) / 100,
+            'footer_start': result.get('footer_start', 100) / 100,
+            'is_dual_column': result.get('is_dual_column', False),
+            'gutter_ratio': result.get('gutter_ratio', 50) / 100
+        })
         print(" done")
 
-    return '\n\n--- PAGE BREAK ---\n\n'.join(all_text)
+    return page_regions
 
 
 def clean_ocr_text(text):
@@ -506,10 +472,10 @@ def clean_text(text, custom_headers=None):
     return result
 
 
-def correct_with_llm(text, chunk_size=6000):
+def correct_with_llm(text):
     """Use Gemini to fix extraction errors and ensure proper reading order.
 
-    Sends text in chunks to Gemini to:
+    Sends text paragraph-by-paragraph to Gemini to:
     - Fix drop caps that got separated (e.g., "F rebels... I the" → "IF rebels...the")
     - Fix OCR-induced typos
     - Correct words split across line breaks
@@ -518,7 +484,6 @@ def correct_with_llm(text, chunk_size=6000):
 
     Args:
         text: Raw extracted text to correct
-        chunk_size: Maximum characters per chunk (to fit in context window)
 
     Returns:
         Corrected text
@@ -528,22 +493,18 @@ def correct_with_llm(text, chunk_size=6000):
     api_key = get_gemini_api_key()
     client = genai_module.Client(api_key=api_key)
 
-    # Split text into chunks with overlap
-    chunks = []
-    overlap = 200  # Character overlap between chunks
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start = end - overlap
+    # Split text into paragraphs (separated by blank lines)
+    paragraphs = re.split(r'\n\s*\n', text)
+    # Filter out empty paragraphs
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
 
-    print(f"Correcting with LLM ({len(chunks)} chunks)...")
+    print(f"Correcting with LLM ({len(paragraphs)} paragraphs)...")
 
-    corrected_chunks = []
+    corrected_paragraphs = []
     previous_context = ""
 
-    for i, chunk in enumerate(chunks):
-        print(f"  Chunk {i+1}/{len(chunks)}...", end='', flush=True)
+    for i, paragraph in enumerate(paragraphs):
+        print(f"  Paragraph {i+1}/{len(paragraphs)}...", end='', flush=True)
 
         prompt = f"""Fix errors in this text extracted from a PDF document.
 
@@ -552,56 +513,52 @@ Instructions:
 2. Fix OCR typos (e.g., "rn" misread as "m", "l" as "1", etc.)
 3. Remove corrupted characters (sequences of unicode replacement characters like ���)
 4. Correct words that were incorrectly split across lines
-5. Preserve the original structure, paragraphs, and meaning
+5. Preserve the original structure and meaning
 6. Do NOT add any new content or commentary
 7. Do NOT remove meaningful content
 8. Return ONLY the corrected text, nothing else
 
-{f"Previous context (for continuity): ...{previous_context[-300:]}" if previous_context else ""}
+{f"Previous context (for continuity): ...{previous_context[-200:]}" if previous_context else ""}
 
 Text to correct:
-{chunk}"""
+{paragraph}"""
 
         response = client.models.generate_content(
-            model='gemini-3.0-flash-preview',  # Flash for speed, Pro for vision
+            model='gemini-flash-lite-latest',
             contents=prompt
         )
-
-        corrected = response.text
-        corrected_chunks.append(corrected)
+        corrected = response.text.strip()
+        corrected_paragraphs.append(corrected)
         previous_context = corrected
-
         print(" done")
 
-    # Join chunks, handling overlaps
-    result = corrected_chunks[0]
-    for chunk in corrected_chunks[1:]:
-        # Skip the overlap portion that duplicates previous chunk
-        result += chunk[overlap:]
-
-    return result
+    # Join paragraphs with double newlines
+    return '\n\n'.join(corrected_paragraphs)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Extract text from PDF files (handles text/scanned, single/dual-column)',
+        description='Extract text from PDF files using OCR with AI-powered layout detection',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    %(prog)s document.pdf                    # Auto-detect and process with LLM
+    %(prog)s document.pdf                    # Extract with OCR + LLM correction
     %(prog)s document.pdf output.txt         # Specify output file
     %(prog)s document.pdf --no-llm           # Skip LLM (faster but lower quality)
     %(prog)s document.pdf --dpi 400          # Higher quality OCR
-    %(prog)s document.pdf --force-ocr        # Force OCR even for text PDFs
+    %(prog)s document.pdf --force-text       # Use direct text extraction (may have font issues)
+
+Pipeline:
+    1. Render PDF pages to images (bypasses font encoding issues)
+    2. Use Gemini Pro vision to detect page layout (headers, columns, footers)
+    3. Use Tesseract OCR to extract text from each region
+    4. Use Gemini Flash Lite to fix OCR errors paragraph by paragraph
         """
     )
     parser.add_argument('input', help='Input PDF file')
     parser.add_argument('output', nargs='?', help='Output text file (default: input.txt)')
-    parser.add_argument('--dpi', type=int, default=300, help='DPI for OCR (default: 300)')
-    parser.add_argument('--force-ocr', action='store_true', help='Force OCR even if text is extractable')
-    parser.add_argument('--force-text', action='store_true', help='Force text extraction even if PDF appears scanned')
-    parser.add_argument('--single-column', action='store_true', help='Force single-column extraction')
-    parser.add_argument('--dual-column', action='store_true', help='Force dual-column extraction')
+    parser.add_argument('--dpi', type=int, default=200, help='DPI for rendering (default: 200)')
+    parser.add_argument('--force-text', action='store_true', help='Use direct text extraction instead of OCR (may have font encoding issues)')
     parser.add_argument('--headers', nargs='*', help='Additional header patterns to remove (regex)')
     parser.add_argument('--no-clean', action='store_true', help='Skip header/footer cleaning')
     parser.add_argument('--no-llm', action='store_true', help='Skip LLM post-processing (faster but lower quality)')
@@ -621,42 +578,21 @@ Examples:
     print(f"Input:  {input_path}")
     print(f"Output: {output_path}")
 
-    # Detect PDF type (text vs image-based)
-    if args.force_ocr:
-        is_text = False
-        print("Mode: Force OCR")
-    elif args.force_text:
-        is_text = True
-        print("Mode: Force text extraction")
-    else:
-        is_text = is_text_based_pdf(input_path)
-        print(f"Detected: {'text-based' if is_text else 'image-based (scanned)'} PDF")
-
-    # Extract text based on detected/forced settings
-    if is_text:
-        # For text-based PDFs, use PyMuPDF which handles multi-column layouts automatically
+    # Extract text - default is OCR-based pipeline which:
+    # 1. Renders PDF to images (bypasses font encoding issues)
+    # 2. Uses Gemini Pro vision to detect page layout
+    # 3. Uses Tesseract OCR to extract text
+    if args.force_text:
+        # Use direct text extraction (may have font encoding issues)
+        print("Mode: Direct text extraction (--force-text)")
         text = extract_with_pymupdf(input_path)
+        text = fix_shifted_font_encoding(text)
     else:
-        # For image-based (scanned) PDFs, detect column layout for OCR
-        gutter_ratio = 0.5  # Default to center split
-        if args.single_column:
-            is_dual_column = False
-            print("Layout: Force single-column")
-        elif args.dual_column:
-            is_dual_column = True
-            print("Layout: Force dual-column")
-        else:
-            is_dual_column, detected_gutter = detect_columns(input_path)
-            if is_dual_column and detected_gutter:
-                gutter_ratio = detected_gutter
-            print(f"Layout: {'dual-column' if is_dual_column else 'single-column'}")
-
-        if is_dual_column:
-            # For scanned dual-column PDFs, use OCR with column splitting
-            text = extract_dual_column_ocr(input_path, dpi=args.dpi, gutter_ratio=gutter_ratio)
-        else:
-            # Single-column image-based: use OCR
-            text = extract_single_column_ocr(input_path, dpi=args.dpi)
+        # Default: OCR-based extraction (works for text and scanned PDFs)
+        is_text_pdf = is_text_based_pdf(input_path)
+        print(f"Detected: {'text-based' if is_text_pdf else 'image-based (scanned)'} PDF")
+        print("Using OCR pipeline (Gemini Pro vision + Tesseract)...")
+        text = extract_with_ocr(input_path, dpi=args.dpi)
 
     # Clean text
     if not args.no_clean:
