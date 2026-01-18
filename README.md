@@ -1,85 +1,79 @@
 # pdf-extract
 
-A robust PDF text extraction tool that handles text-based and scanned PDFs, with automatic multi-column layout detection.
+A PDF text extraction tool designed for audiobook conversion. Uses Gemini Pro vision to reliably extract text from academic papers, including those with copy-protection or complex multi-column layouts.
 
 ## Features
 
-- **Auto-detection**: Automatically determines if a PDF needs OCR or has extractable text
-- **Multi-column support**: Detects and properly orders two-column academic paper layouts
+- **Gemini Pro vision extraction**: Renders PDFs to images and uses Gemini Pro for text extraction
+- **Handles multi-column layouts**: Gemini Pro vision automatically handles complex layouts
+- **Bypasses font encoding issues**: Works with copy-protected PDFs that have garbled text extraction
 - **Smart header removal**: Automatically detects and removes running headers/footers
-- **OCR support**: Uses Tesseract for scanned documents
-- **Configurable**: DPI settings, custom header patterns, force modes
+- **Configurable**: DPI settings, force text mode
 
 ## Installation
 
 ```bash
 # System dependencies (macOS)
-brew install tesseract poppler
+brew install poppler
 
 # System dependencies (Linux)
-sudo apt install tesseract-ocr poppler-utils
+sudo apt install poppler-utils
 
 # Python dependencies
 pip install -r requirements.txt
+
+# Required: Gemini API key
+export GEMINI_API_KEY="your-key-here"  # or GOOGLE_API_KEY
 ```
 
 ## Usage
 
 ```bash
-# Basic usage - auto-detects PDF type and column layout
+# Extract to stdout (progress goes to stderr)
 python pdf_to_text.py document.pdf
 
-# Specify output file
-python pdf_to_text.py document.pdf output.txt
+# Save to file
+python pdf_to_text.py document.pdf -o output.txt
 
-# Force OCR (for problematic text PDFs)
-python pdf_to_text.py document.pdf --force-ocr
+# Higher DPI for better quality
+python pdf_to_text.py document.pdf --dpi 300
 
-# Higher DPI for better OCR quality
-python pdf_to_text.py document.pdf --dpi 400
-
-# Force single or dual column mode
-python pdf_to_text.py document.pdf --single-column
-python pdf_to_text.py document.pdf --dual-column
+# Force direct text extraction (may have font issues)
+python pdf_to_text.py document.pdf --force-text
 
 # Add custom header patterns to remove (regex)
 python pdf_to_text.py document.pdf --headers "RUNNING HEADER" "Author Name"
+
+# Pipe to another command
+python pdf_to_text.py document.pdf 2>/dev/null | head -100
 ```
 
 ## Options
 
 | Option | Description |
 |--------|-------------|
-| `--dpi N` | DPI for OCR (default: 300) |
-| `--force-ocr` | Force OCR even if text is extractable |
-| `--force-text` | Force text extraction even if PDF appears scanned |
-| `--single-column` | Force single-column extraction |
-| `--dual-column` | Force dual-column extraction |
+| `-o, --output FILE` | Output file (default: stdout) |
+| `--dpi N` | DPI for rendering (default: 200) |
+| `--force-text` | Use direct text extraction instead of OCR |
 | `--headers PATTERN...` | Additional header patterns to remove (regex) |
-| `--no-clean` | Skip header/footer cleaning |
 
 ## How It Works
 
-1. **Detection**:
-   - Checks if PDF has extractable text using pdftotext
-   - Analyzes word positions to detect two-column layouts
+1. **Rendering**: PDF pages are rendered to images at the specified DPI (default 200)
 
-2. **Extraction**:
-   - Text PDFs: Uses PyMuPDF (pymupdf4llm) which automatically handles multi-column layouts
-   - Scanned single-column: Full-page OCR with Tesseract
-   - Scanned dual-column: Splits page at detected gutter, OCRs each half separately
-
-3. **Cleaning**:
-   - Detects running headers by finding lines that repeat across pages (with different page numbers)
-   - Removes standalone page numbers, DOIs, copyright notices, and other artifacts
+2. **Extraction & Cleaning**: For each page:
+   - Gemini Pro vision extracts text from the page image
+   - Handles multi-column layouts automatically
+   - Preserves proper reading order (headers → body → footnotes)
+   - Cleans the page (removes page numbers, DOIs, copyright notices)
+   - Streams the cleaned text to stdout immediately
 
 ## Dependencies
 
-- **pymupdf4llm**: Primary text extraction with automatic column handling
-- **pdfplumber**: Column layout detection
-- **pytesseract**: OCR for scanned documents
-- **pdf2image**: PDF to image conversion for OCR
+- **google-genai**: Gemini API for vision text extraction
+- **pdf2image**: PDF to image conversion
 - **poppler** (pdftotext): Quick text detection
+- **pymupdf4llm**: Alternative direct text extraction
 
 ## License
 

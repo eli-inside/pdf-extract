@@ -1,2 +1,7 @@
 .vscode/settings.json
 tmp
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.venv/
