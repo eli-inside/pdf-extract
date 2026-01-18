@@ -218,11 +218,92 @@ def extract_with_pymupdf(pdf_path):
     return md_text
 
 
+def detect_column_regions(pdf_path, gutter_ratio=0.5):
+    """Detect where full-width header ends and two-column body begins on each page.
+
+    Analyzes word positions to find where the gutter gap first appears consistently,
+    indicating the transition from full-width header to two-column body.
+
+    Args:
+        pdf_path: Path to the PDF file
+        gutter_ratio: Expected gutter position as ratio of page width (0-1)
+
+    Returns:
+        List of floats: header_end_ratio for each page (0-1, as fraction of page height)
+    """
+    import pdfplumber
+
+    header_ratios = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            page_width = page.width
+            page_height = page.height
+
+            # Define gutter zone (center ± 3% of page width - tighter zone)
+            gutter_left = page_width * (gutter_ratio - 0.03)
+            gutter_right = page_width * (gutter_ratio + 0.03)
+
+            words = page.extract_words(x_tolerance=3, y_tolerance=3)
+            if not words:
+                header_ratios.append(0.0)
+                continue
+
+            # Divide page into horizontal bands (2% of page height each)
+            band_height = page_height * 0.02
+            num_bands = int(page_height / band_height)
+
+            # For each band, check if any word center falls in the gutter zone
+            band_has_gutter_word = [False] * num_bands
+
+            for word in words:
+                word_center_x = (word['x0'] + word['x1']) / 2
+                word_center_y = (word['top'] + word['bottom']) / 2
+                band_idx = min(int(word_center_y / band_height), num_bands - 1)
+
+                if gutter_left < word_center_x < gutter_right:
+                    band_has_gutter_word[band_idx] = True
+
+            # Find the END of the contiguous header region
+            # Header = area where gutter words appear; ends when 3+ consecutive bands are empty
+            first_gutter_band = None
+            header_end_band = 0
+
+            for band_idx, has_word in enumerate(band_has_gutter_word):
+                if has_word:
+                    if first_gutter_band is None:
+                        first_gutter_band = band_idx
+                    header_end_band = band_idx + 1  # Header extends through this band
+
+            # Now find where the header actually ends (3+ consecutive empty bands after header starts)
+            if first_gutter_band is not None:
+                consecutive_empty = 0
+                for band_idx in range(first_gutter_band, num_bands):
+                    if not band_has_gutter_word[band_idx]:
+                        consecutive_empty += 1
+                        if consecutive_empty >= 3:
+                            # Header ends at the start of this empty region
+                            header_end_band = band_idx - 2
+                            break
+                    else:
+                        consecutive_empty = 0
+                        header_end_band = band_idx + 1
+
+                header_end_ratio = min((header_end_band * band_height) / page_height, 0.4)
+            else:
+                # No gutter words found - no header, columns start at top
+                header_end_ratio = 0.0
+
+            header_ratios.append(header_end_ratio)
+
+    return header_ratios
+
+
 def extract_dual_column_ocr(pdf_path, dpi=300, gutter_ratio=0.5):
     """Extract text from dual-column image-based PDF using OCR with image splitting.
 
-    Splits each page image at the detected gutter position and OCRs each half
-    separately to ensure proper column reading order.
+    Handles full-width headers by detecting and OCRing them separately from the
+    two-column body. This prevents headers from being split and jumbled.
 
     Args:
         pdf_path: Path to the PDF file
@@ -234,6 +315,9 @@ def extract_dual_column_ocr(pdf_path, dpi=300, gutter_ratio=0.5):
 
     print(f"Extracting text via OCR at {dpi} DPI (dual-column, split at {gutter_ratio:.1%})...")
 
+    # Detect header regions for each page
+    header_ratios = detect_column_regions(pdf_path, gutter_ratio)
+
     images = convert_from_path(pdf_path, dpi=dpi)
     print(f"Processing {len(images)} pages...")
 
@@ -244,30 +328,47 @@ def extract_dual_column_ocr(pdf_path, dpi=300, gutter_ratio=0.5):
 
         width, height = image.size
         gutter_x = int(width * gutter_ratio)
+        margin = int(width * 0.01)
 
-        # Extend each half significantly past the center to capture all edge text
-        # Use 55% for left and start at 45% for right - 10% overlap total
-        left_end = int(width * 0.55)
-        right_start = int(width * 0.45)
-        left_half = image.crop((0, 0, left_end, height))
-        right_half = image.crop((right_start, 0, width, height))
+        # Get header boundary for this page
+        header_ratio = header_ratios[i] if i < len(header_ratios) else 0.0
+        header_end_y = int(height * header_ratio)
 
-        # OCR each half with single-column mode
-        config = r'--oem 3 --psm 4'
+        page_parts = []
 
-        left_text = pytesseract.image_to_string(left_half, lang='eng', config=config)
-        right_text = pytesseract.image_to_string(right_half, lang='eng', config=config)
+        # OCR header region as single full-width region (if exists)
+        if header_end_y > 0:
+            header_region = image.crop((0, 0, width, header_end_y))
+            header_config = r'--oem 3 --psm 3'  # Full page segmentation for header
+            header_text = pytesseract.image_to_string(header_region, lang='eng', config=header_config)
+            header_text = clean_ocr_text(header_text)
+            if header_text.strip():
+                page_parts.append(header_text)
 
-        # Clean up each column
-        left_text = clean_ocr_text(left_text)
-        right_text = clean_ocr_text(right_text)
+        # OCR two-column body region
+        body_top = header_end_y
+        if body_top < height:
+            # Crop left and right columns from body region only
+            left_half = image.crop((0, body_top, gutter_x - margin, height))
+            right_half = image.crop((gutter_x + margin, body_top, width, height))
 
-        # Combine: left column first, then right column
-        if left_text and right_text:
-            page_text = left_text + "\n\n" + right_text
-        else:
-            page_text = left_text or right_text or ""
+            # OCR each half with single-column mode
+            config = r'--oem 3 --psm 4'
 
+            left_text = pytesseract.image_to_string(left_half, lang='eng', config=config)
+            right_text = pytesseract.image_to_string(right_half, lang='eng', config=config)
+
+            # Clean up each column
+            left_text = clean_ocr_text(left_text)
+            right_text = clean_ocr_text(right_text)
+
+            # Add columns in reading order
+            if left_text.strip():
+                page_parts.append(left_text)
+            if right_text.strip():
+                page_parts.append(right_text)
+
+        page_text = "\n\n".join(page_parts)
         all_text.append(page_text)
         print(" done")
 
